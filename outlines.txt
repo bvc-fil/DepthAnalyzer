@@ -1,0 +1,42 @@
+We are creating a python application that uses the IDS peak SDK to get depth frames from a Nion camera attached to the computer via an ethernet cable.
+
+The application first needs to help guide us through connecting to and setting up/calibrating the camera.
+1) make sure camera has power
+2) make sure camera is correctly connected (physically) to the computer
+3) establish connection to the camera
+4) load any configurations to the camera
+5) set gain, exposure, and frame rate
+
+All actions should be logged to a log file and to standard out.
+
+Once connected, the application needs to show a user-controlled viewing widget with the 3d depth data as a point cloud.  this viewer widget should allow zoom in and out with the mouse wheel, orbit rotation when moving the mouse with just the right mouse button held down and pan when moving the mouse with the center mouse button held down. there should be a ui button to click and reset the 3d view camera.
+
+Noise measurements
+The user needs to determine the amount of noise present in the depth readings from the camera/sensor.  
+We should be able to choose a time duration and then use a infrared image from the camera to select a rectangle region of interest and then record each depth reading for each pixel in the rectangle for that duration.  Afterwards we should be able to see histograms of the depth readings and stand deviations for each individual pixel in the region of interest rectangle.  To accomplish this a series of data for each depth pixel needs to be recorded: the pixel id (x,y) and the time (unix timestamp) of pixel recording.  
+
+Additional Ideas for data read out
+===================================
+A sequence graph showing all depth readings for the chosen pixel in sequence from first to last.  The x-axis is the time and the y axis is the reported depth reading
+Allowing changes to the gradients on the std deviation image, to better show regional variations
+Showing a graph of points plotted at x = mean depth and y = std dev
+make the histogram have consistent x and y axis across all pixels so it is easier to compare one histogram to another
+include the cropped/selected roi ir image at the same scale as the std dev and mean depth images
+A histogram of standard deviations from every pixel with recordings
+A histogram of depths from all pixels with recordings
+
+
+Adding 3d Prisms
+To make rough measurements the user needs to place rectangular prisms of exact size (in millimeters) alongside the pointcloud.
+The viewer widget should allow the user to place 3d rectangular prisms in the space with the point cloud.
+Clicking on a prism should select the prism and allow modifications to occur.
+Once added to the scene, the user should be able to modify the position, size, and rotation of the selected rectangular prism using in-scene, mouse-draggable modifiers and separate direct value number entry text boxes. 
+A selected prism can be deleted with using a ui button, or by pressing the delete key on the keyboard.
+
+Save/Load
+An scene consists of the camera configurations, the prisms added to the scene, and any recorded depth data series.
+A user can save this data as a file to disk.
+A user can load this data from disk.
+
+
+

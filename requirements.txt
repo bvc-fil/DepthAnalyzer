@@ -1,0 +1,4 @@
+ids_peak>=1.16
+ids_peak_ipl>=1.17
+ids_peak_icv>=1.4
+numpy>=2.0
