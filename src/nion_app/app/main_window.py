@@ -1,23 +1,27 @@
 """Main application window: connects to the camera on startup and continuously
-streams live depth frames into the 3D point cloud viewer."""
+streams live depth frames into the noise-measurement panel."""
 from __future__ import annotations
 
 import logging
+import time
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QDockWidget, QMainWindow, QMessageBox
 
 from nion_app.camera.backend import CameraBackend
 from nion_app.camera.connection_flow import ConnectionStepFailed, run_guided_connection
-from nion_app.camera.point_cloud import depth_to_point_cloud, nion_nominal_intrinsics
+from nion_app.app.camera_settings_panel import CameraSettingsPanel
 from nion_app.app.noise_panel import NoisePanel
-from nion_app.app.prism_panel import PrismPanel
-from nion_app.viewer.prism_scene_view import PrismSceneView
+from nion_app.viewer.depth_view import DepthView
 
 logger = logging.getLogger(__name__)
 
-_MIN_CONFIDENCE = 1
-_FRAME_INTERVAL_MS = 100  # ~10 Hz refresh; the sensor itself runs up to 30 fps
+_FALLBACK_FRAME_INTERVAL_MS = 100  # used only until the camera's real frame rate is known
+
+# Same rationale as NoisePanel's IR-preview throttle: while a recording is in
+# progress, the depth preview's per-frame colorization competes with the
+# recorder for main-thread time at exactly the frame rate that matters most.
+_DEPTH_PREVIEW_THROTTLE_INTERVAL_S = 0.2
 
 
 class MainWindow(QMainWindow):
@@ -25,40 +29,87 @@ class MainWindow(QMainWindow):
 
     def __init__(self, backend: CameraBackend) -> None:
         super().__init__()
-        self.setWindowTitle("Nion Depth Viewer")
+        self.setWindowTitle("Nion Noise Measurement")
 
         self._backend = backend
-        self._intrinsics = None
         self._frame_timer = QTimer(self)
+        self._frame_timer.setInterval(_FALLBACK_FRAME_INTERVAL_MS)
         self._frame_timer.timeout.connect(self._update_frame)
+        self._last_depth_preview_time = 0.0
 
-        self._view = PrismSceneView(self)
-        self.setCentralWidget(self._view)
-
-        prism_dock = QDockWidget("Prisms", self)
-        prism_dock.setWidget(PrismPanel(self._view, prism_dock))
-        self.addDockWidget(Qt.RightDockWidgetArea, prism_dock)
-
-        self._noise_panel = NoisePanel(self)
+        self._noise_panel = NoisePanel(backend, self)
         self.frame_captured.connect(self._noise_panel.on_frame)
-        noise_dock = QDockWidget("Noise Measurement", self)
-        noise_dock.setWidget(self._noise_panel)
-        self.addDockWidget(Qt.RightDockWidgetArea, noise_dock)
+        self.setCentralWidget(self._noise_panel)
 
-        self.resize(1280, 800)
+        self._depth_view = DepthView(self)
+        self.frame_captured.connect(self._on_frame_for_depth_preview)
+        depth_dock = QDockWidget("Depth Preview", self)
+        depth_dock.setWidget(self._depth_view)
+        self.addDockWidget(Qt.RightDockWidgetArea, depth_dock)
+
+        self._camera_settings_panel = CameraSettingsPanel(backend, self)
+        self._camera_settings_panel.frame_rate_changed.connect(self._on_camera_frame_rate_changed)
+        settings_dock = QDockWidget("Camera Settings", self)
+        settings_dock.setWidget(self._camera_settings_panel)
+        self.addDockWidget(Qt.LeftDockWidgetArea, settings_dock)
+
+        self.resize(1300, 750)
 
     def start(self, configuration_name: str = "Default") -> bool:
+        """Connects to the camera and starts live acquisition. Returns False
+        if the camera couldn't be connected - the window is still fully
+        usable in that case (recording just stays unavailable), so callers
+        should show() it regardless rather than treating this as fatal."""
         try:
             run_guided_connection(self._backend, configuration_name=configuration_name)
         except ConnectionStepFailed as exc:
             logger.error("Connection failed at step '%s': %s", exc.step, exc.reason)
-            QMessageBox.critical(self, "Camera connection failed", f"{exc.step}: {exc.reason}")
+            QMessageBox.warning(
+                self,
+                "Camera connection failed",
+                f"{exc.step}: {exc.reason}\n\n"
+                "Continuing without a live camera - you can still load and "
+                "view a previously saved dataset.",
+            )
+            self._noise_panel.set_camera_unavailable(f"{exc.step}: {exc.reason}")
             return False
 
+        # Emits frame_rate_changed with the camera's actual current rate,
+        # which _on_camera_frame_rate_changed uses to set the timer's real
+        # interval before it's started below - so recording starts already
+        # sampling at the camera's configured rate, not the fallback one.
+        self._camera_settings_panel.refresh_from_backend()
         self._backend.start_acquisition()
-        self._frame_timer.start(_FRAME_INTERVAL_MS)
-        logger.info("Live view started (refresh every %d ms)", _FRAME_INTERVAL_MS)
+        self._frame_timer.start()
+        logger.info(
+            "Live view started (refresh every %d ms)", self._frame_timer.interval()
+        )
         return True
+
+    def _on_camera_frame_rate_changed(self, frame_rate_fps: float) -> None:
+        """Keeps the acquisition-polling timer in step with the camera's
+        actual frame rate, so recorded samples land at that rate instead of
+        a fixed, possibly mismatched, polling interval."""
+        if frame_rate_fps <= 0:
+            logger.warning(
+                "Ignoring non-positive camera frame rate %.2f fps; keeping %d ms interval",
+                frame_rate_fps, self._frame_timer.interval(),
+            )
+            return
+        interval_ms = max(1, round(1000.0 / frame_rate_fps))
+        self._frame_timer.setInterval(interval_ms)
+        logger.info(
+            "Camera frame rate is %.2f fps; polling interval set to %d ms",
+            frame_rate_fps, interval_ms,
+        )
+
+    def _on_frame_for_depth_preview(self, frame) -> None:
+        if self._noise_panel.is_recording:
+            now = time.monotonic()
+            if now - self._last_depth_preview_time < _DEPTH_PREVIEW_THROTTLE_INTERVAL_S:
+                return
+            self._last_depth_preview_time = now
+        self._depth_view.on_frame(frame)
 
     def _update_frame(self) -> None:
         try:
@@ -67,18 +118,6 @@ class MainWindow(QMainWindow):
             logger.exception("Failed to acquire frame; skipping this refresh")
             return
 
-        if self._intrinsics is None:
-            height, width = frame.depth_mm.shape
-            self._intrinsics = nion_nominal_intrinsics(width, height)
-
-        points, point_intensity = depth_to_point_cloud(
-            frame.depth_mm,
-            self._intrinsics,
-            intensity=frame.intensity,
-            confidence=frame.confidence,
-            min_confidence=_MIN_CONFIDENCE,
-        )
-        self._view.set_points(points, scalars=point_intensity)
         self.frame_captured.emit(frame)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
@@ -103,15 +142,6 @@ class MainWindow(QMainWindow):
             self._noise_panel.close_results_windows()
         except Exception:
             logger.exception("Error closing noise-results windows")
-
-        # The pyvista/VTK view holds native render-window and OpenGL
-        # resources (plus its own render_timer) that outlive this widget
-        # unless explicitly closed - left alone, they keep the process
-        # running in the background after the window disappears.
-        try:
-            self._view.shutdown()
-        except Exception:
-            logger.exception("Error shutting down the 3D view")
 
         # Each cleanup step above is independently guarded: one raising must
         # never prevent the steps after it - especially the app.quit() below,

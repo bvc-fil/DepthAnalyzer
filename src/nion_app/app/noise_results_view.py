@@ -13,6 +13,8 @@ from matplotlib.figure import Figure
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QTabWidget,
@@ -20,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from nion_app.camera.noise_recording import NoiseRecording
+from nion_app.camera.noise_recording import NoiseRecording, RecordingStats
 
 # A full rainbow gradient for the mean-depth image, distinct from the
 # std. dev. image's colormap, with extreme readings pinned to the extreme
@@ -38,16 +40,16 @@ _STD_CMAP_DEFAULT = "inferno"
 _ACCENT = "#2a78d6"
 _MARKER_COLOR = "#e34948"
 
-_HIST_BINS = 300  # 10x narrower bars than a plain 30-bin histogram, to make the spread easier to see
-
 
 class NoiseResultsView(QWidget):
-    def __init__(self, recording: NoiseRecording, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, recording: NoiseRecording, stats: RecordingStats, parent: QWidget | None = None
+    ) -> None:
         super().__init__(parent)
         self._recording = recording
-        self._mean_grid, self._std_grid = recording.per_pixel_mean_std()
-        self._hist_bin_edges = recording.depth_histogram_bin_edges(bins=_HIST_BINS)
-        self._hist_ymax = recording.max_pixel_histogram_count(self._hist_bin_edges)
+        self._mean_grid, self._std_grid = stats.mean_grid, stats.std_grid
+        self._hist_bin_edges = stats.hist_bin_edges
+        self._hist_ymax = stats.hist_ymax
 
         roi = recording.roi
         self._selected_x, self._selected_y = roi.x, roi.y
@@ -68,46 +70,65 @@ class NoiseResultsView(QWidget):
         tab = QWidget()
         tab_layout = QVBoxLayout(tab)
 
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Click a heatmap below to inspect a pixel."))
-        controls.addSpacing(20)
-        controls.addWidget(QLabel("Std. dev. gradient:"))
+        # A 3-column header mirroring the mean/std/IR heatmap columns below,
+        # so the gradient controls sit as a small sub-region directly above
+        # the std. dev. column instead of a full-width toolbar.
+        header = QGridLayout()
+        header.setColumnStretch(0, 1)
+        header.setColumnStretch(1, 1)
+        header.setColumnStretch(2, 1)
+
+        header.addWidget(QLabel("Click a heatmap below to inspect a pixel."), 0, 0)
+
+        std_controls_box = QGroupBox("Std. dev. gradient")
+        std_controls = QHBoxLayout(std_controls_box)
+        std_controls.setContentsMargins(6, 2, 6, 2)
+        std_controls.setSpacing(4)
+
         self._std_cmap_box = QComboBox()
         self._std_cmap_box.addItems(_STD_CMAP_OPTIONS)
         self._std_cmap_box.setCurrentText(_STD_CMAP_DEFAULT)
+        self._std_cmap_box.setMaximumWidth(90)
         self._std_cmap_box.currentTextChanged.connect(self._on_std_gradient_changed)
-        controls.addWidget(self._std_cmap_box)
+        std_controls.addWidget(self._std_cmap_box)
 
-        controls.addWidget(QLabel("Clip low"))
+        std_controls.addWidget(QLabel("clip"))
         self._std_low_box = QDoubleSpinBox()
         self._std_low_box.setRange(0.0, 99.0)
-        self._std_low_box.setSuffix(" %")
+        self._std_low_box.setSuffix("%")
+        self._std_low_box.setMaximumWidth(60)
         self._std_low_box.valueChanged.connect(self._on_std_gradient_changed)
-        controls.addWidget(self._std_low_box)
+        std_controls.addWidget(self._std_low_box)
 
-        controls.addWidget(QLabel("Clip high"))
+        std_controls.addWidget(QLabel("-"))
         self._std_high_box = QDoubleSpinBox()
         self._std_high_box.setRange(1.0, 100.0)
         self._std_high_box.setValue(100.0)
-        self._std_high_box.setSuffix(" %")
+        self._std_high_box.setSuffix("%")
+        self._std_high_box.setMaximumWidth(60)
         self._std_high_box.valueChanged.connect(self._on_std_gradient_changed)
-        controls.addWidget(self._std_high_box)
-        controls.addStretch(1)
+        std_controls.addWidget(self._std_high_box)
+
+        header.addWidget(std_controls_box, 0, 1)
 
         self._selected_label = QLabel()
-        controls.addWidget(self._selected_label)
-        tab_layout.addLayout(controls)
+        header.addWidget(self._selected_label, 0, 2)
+        tab_layout.addLayout(header)
 
-        self._figure = Figure(figsize=(13, 8), constrained_layout=True)
+        self._figure = Figure(figsize=(13, 10), constrained_layout=True)
         self._canvas = FigureCanvasQTAgg(self._figure)
         tab_layout.addWidget(self._canvas)
 
-        grid = self._figure.add_gridspec(2, 3)
+        # 3 rows now: heatmaps, then the sequence with its FFT stacked
+        # underneath it (sharing the histogram's row so there's no dead
+        # space - the histogram spans both of those rows instead).
+        grid = self._figure.add_gridspec(3, 3)
         self._mean_ax = self._figure.add_subplot(grid[0, 0])
         self._std_ax = self._figure.add_subplot(grid[0, 1])
         self._ir_ax = self._figure.add_subplot(grid[0, 2])
-        self._hist_ax = self._figure.add_subplot(grid[1, 0])
+        self._hist_ax = self._figure.add_subplot(grid[1:, 0])
         self._seq_ax = self._figure.add_subplot(grid[1, 1:])
+        self._fft_ax = self._figure.add_subplot(grid[2, 1:])
 
         self._canvas.mpl_connect("button_press_event", self._on_heatmap_click)
         self._init_heatmaps()
@@ -229,6 +250,35 @@ class NoiseResultsView(QWidget):
         ax.set_xlabel("time (s)")
         ax.set_ylabel("depth (mm)")
 
+    def _draw_fft(self, x: int, y: int) -> None:
+        timestamps, depths = self._recording.pixel_series(x, y)
+        ax = self._fft_ax
+        ax.clear()
+        ax.set_xlabel("frequency (Hz)")
+        ax.set_ylabel("amplitude (mm)")
+
+        if len(depths) < 2:
+            ax.set_title(f"Pixel ({x},{y}) FFT\nnot enough valid readings", fontsize=10)
+            return
+
+        # Dropouts are already excluded by pixel_series(), so the remaining
+        # samples aren't perfectly evenly spaced - same approximation the
+        # sequence plot above already makes. The median sample spacing is a
+        # robust enough stand-in for the sampling rate to get a usable
+        # frequency axis out of a plain FFT.
+        dt = float(np.median(np.diff(timestamps)))
+        if not np.isfinite(dt) or dt <= 0:
+            ax.set_title(f"Pixel ({x},{y}) FFT\nirregular sampling, can't compute", fontsize=10)
+            return
+
+        detrended = depths - depths.mean()
+        spectrum = np.abs(np.fft.rfft(detrended)) / len(detrended)
+        freqs = np.fft.rfftfreq(len(detrended), d=dt)
+        # Skip the DC bin: it's ~0 after removing the mean, and leaving it in
+        # would compress the axis for every frequency that actually matters.
+        ax.plot(freqs[1:], spectrum[1:], linewidth=0.8, color=_ACCENT)
+        ax.set_title(f"Pixel ({x},{y}) FFT of depth sequence (fs~{1 / dt:.1f}Hz)", fontsize=10)
+
     def _select_pixel(self, x: int, y: int) -> None:
         roi = self._recording.roi
         row, col = y - roi.y, x - roi.x
@@ -240,6 +290,7 @@ class NoiseResultsView(QWidget):
         self._update_selected_pixel_markers()
         self._draw_histogram(x, y)
         self._draw_sequence(x, y)
+        self._draw_fft(x, y)
         self._canvas.draw_idle()
 
     def _on_heatmap_click(self, event) -> None:

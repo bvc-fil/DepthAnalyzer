@@ -10,6 +10,15 @@ components in one multi-part buffer per frame -
 Gain/ExposureTime/AcquisitionFrameRate are standard GenICam float nodes, and
 persisted configurations are loaded via the standard UserSetSelector/
 UserSetLoad command pair.
+
+The device also stores a "LensCalibrationData" file in its persistent memory
+that must be uploaded (via ids_peak's FileAdapter, per IDS's own documented
+usage: FileAdapter(node_map, file_name).Write(data)) before the depth output
+is properly calibrated. FileAdapter.Write() re-initializes every GenTL
+producer DeviceManager knows about, not just the one for this device - see
+_find_gev_producer_path's docstring for why this backend explicitly registers
+only the GigE producer instead of letting GENICAM_GENTL64_PATH's directory
+get scanned wholesale.
 """
 from __future__ import annotations
 
@@ -35,41 +44,76 @@ logger = logging.getLogger(__name__)
 _INTENSITY_FORMAT = "MONO_8"
 _RANGE_FORMAT = "COORD3D_C16"
 _CONFIDENCE_FORMAT = "CONFIDENCE_16"
+_CALIBRATION_FILE_NAME = "LensCalibrationData"
 
 
-def _ensure_gentl_producer_path() -> None:
-    """The IDS peak GenTL layer refuses to enumerate devices unless
-    GENICAM_GENTL64_PATH points at the .cti producers. A full SDK install
-    doesn't set this for you, so auto-detect it under the standard install
-    location instead of making every developer export it by hand."""
-    if os.environ.get("GENICAM_GENTL64_PATH"):
-        return
-    candidates = sorted(glob.glob("/opt/ids-peak*/lib/*/ids-peak/cti"))
-    if not candidates:
-        raise CameraError(
-            "GENICAM_GENTL64_PATH is not set and no IDS peak CTI directory was "
-            "found under /opt. Install the IDS peak SDK or set the variable manually."
-        )
-    os.environ["GENICAM_GENTL64_PATH"] = candidates[0]
-    logger.info("GENICAM_GENTL64_PATH not set; using detected path %s", candidates[0])
+_GEV_PRODUCER_FILENAME = "ids_gevgentl.cti"  # GigE Vision - the only producer the Nion needs
+
+
+def _find_gev_producer_path() -> str:
+    """Locates the GigE Vision GenTL producer (.cti) the Nion needs.
+
+    Returns one specific file rather than a directory to scan on purpose.
+    DeviceManager.Update()'s default policy scans every producer under
+    GENICAM_GENTL64_PATH, and a real IDS peak install directory can also
+    bundle a producer for legacy uEye USB cameras (fails to load if its
+    runtime .so is missing) or a "proxy" producer that fails its own
+    unrelated internal init - plain device discovery tolerates either
+    failure, but FileAdapter.Write() (used by load_calibration_file) does
+    not, and surfaces it as a hard CTI_LOADING_ERROR. The Nion never needs
+    any producer but this one, so the backend explicitly registers just this
+    file via DeviceManager.AddProducerLibrary() and always updates with
+    UpdatePolicy_DontScanEnvironmentForProducerLibraries (see __init__ and
+    discover()/connect()) - environment-variable directory scanning, and
+    every other producer that would come with it, is never touched at all.
+
+    GENICAM_GENTL64_PATH is still honored as an override if set, pointing at
+    either the producer file directly or a directory to find it under.
+    """
+    override = os.environ.get("GENICAM_GENTL64_PATH")
+    if override and os.path.isfile(override):
+        return override
+    search_dirs = [override] if override else sorted(
+        glob.glob("/opt/ids-peak*/lib/*/ids-peak/cti"),
+        key=lambda path: ("ueyetl" in path, path),
+    )
+    for directory in search_dirs:
+        candidate = os.path.join(directory, _GEV_PRODUCER_FILENAME)
+        if os.path.isfile(candidate):
+            return candidate
+
+    raise CameraError(
+        f"Could not find {_GEV_PRODUCER_FILENAME} under GENICAM_GENTL64_PATH or "
+        "the standard IDS peak install locations under /opt. Install the IDS "
+        "peak SDK or set GENICAM_GENTL64_PATH to the producer's file or directory."
+    )
 
 
 class IdsPeakBackend(CameraBackend):
     def __init__(self) -> None:
-        _ensure_gentl_producer_path()
         import ids_peak.ids_peak as ids_peak
 
         self._ids_peak = ids_peak
         self._ids_peak.Library.Initialize()
+        gev_producer_path = _find_gev_producer_path()
+        self._ids_peak.DeviceManager.Instance().AddProducerLibrary(gev_producer_path)
         self._device = None
+        self._device_info: DeviceInfo | None = None
         self._node_map = None
         self._data_stream = None
         self._acquiring = False
-        logger.info("IDS peak library initialized")
+        logger.info("IDS peak library initialized (producer: %s)", gev_producer_path)
+
+    def _update_device_manager(self):
+        dm = self._ids_peak.DeviceManager.Instance()
+        # Only the GigE producer explicitly registered in __init__ is ever
+        # considered - environment-variable directory scanning (and every
+        # other producer that would come with it) is skipped entirely.
+        dm.Update(self._ids_peak.DeviceManager.UpdatePolicy_DontScanEnvironmentForProducerLibraries)
+        return dm
 
     def discover(self) -> list[DeviceInfo]:
-        dm = self._ids_peak.DeviceManager.Instance()
-        dm.Update()
+        dm = self._update_device_manager()
         infos = [
             DeviceInfo(
                 serial_number=d.SerialNumber(),
@@ -87,8 +131,7 @@ class IdsPeakBackend(CameraBackend):
         return infos
 
     def connect(self, serial_number: str | None = None) -> None:
-        dm = self._ids_peak.DeviceManager.Instance()
-        dm.Update()
+        dm = self._update_device_manager()
         descriptors = dm.Devices()
         if not descriptors:
             raise CameraNotFoundError(
@@ -102,8 +145,21 @@ class IdsPeakBackend(CameraBackend):
                 raise CameraNotFoundError(f"No device with serial number {serial_number}")
             chosen = matches[0]
 
-        self._device = chosen.OpenDevice(self._ids_peak.DeviceAccessType_Control)
+        # Exclusive rather than Control: writing the File Access Control
+        # registers (for load_calibration_file) has been observed to fail at
+        # the GVCP wire level with ACCESS_DENIED under Control access, even
+        # though every other feature (exposure/gain/UserSet/acquisition)
+        # works fine under either - the device firmware itself appears to
+        # gate file writes behind the higher privilege level. This app is the
+        # sole intended controller of the camera for its session, so there's
+        # no concurrent-access use case being given up here.
+        self._device = chosen.OpenDevice(self._ids_peak.DeviceAccessType_Exclusive)
         self._node_map = self._device.RemoteDevice().NodeMaps()[0]
+        self._device_info = DeviceInfo(
+            serial_number=chosen.SerialNumber(),
+            model_name=chosen.ModelName(),
+            display_name=chosen.DisplayName(),
+        )
         logger.info(
             "Connected to %s (serial %s)", chosen.ModelName(), chosen.SerialNumber()
         )
@@ -113,6 +169,7 @@ class IdsPeakBackend(CameraBackend):
             self.stop_acquisition()
         self._data_stream = None
         self._device = None
+        self._device_info = None
         self._node_map = None
         self._ids_peak.Library.Close()
         logger.info("Disconnected and closed IDS peak library")
@@ -120,6 +177,10 @@ class IdsPeakBackend(CameraBackend):
     @property
     def is_connected(self) -> bool:
         return self._node_map is not None
+
+    @property
+    def device_info(self) -> DeviceInfo | None:
+        return self._device_info
 
     def _require_connected(self):
         if self._node_map is None:
@@ -225,6 +286,15 @@ class IdsPeakBackend(CameraBackend):
         self._data_stream.StopAcquisition(self._ids_peak.AcquisitionStopMode_Default)
         nm.FindNode("TLParamsLocked").SetValue(0)
         self._data_stream.Flush(self._ids_peak.DataStreamFlushMode_DiscardAll)
+        # Buffers announced via AllocAndAnnounceBuffer() in start_acquisition()
+        # must be explicitly revoked (only possible now that Flush(DiscardAll)
+        # has moved them out of the queued state) and the stream reference
+        # dropped - otherwise a later start_acquisition() call in the same
+        # session (e.g. resuming after loading a calibration file) opens a
+        # second data stream while these are still announced on the first.
+        for buffer in self._data_stream.AnnouncedBuffers():
+            self._data_stream.RevokeBuffer(buffer)
+        self._data_stream = None
         self._acquiring = False
         logger.info("Acquisition stopped")
 
@@ -259,3 +329,45 @@ class IdsPeakBackend(CameraBackend):
             self._data_stream.QueueBuffer(buffer)
 
         return frame
+
+    def load_calibration_file(self, path: str, file_name: str | None = None) -> None:
+        target_name = file_name or _CALIBRATION_FILE_NAME
+        nm = self._require_connected()
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            raise CameraError(f"Could not read calibration file '{path}': {exc}") from exc
+
+        # FileSelector (and file access generally) is only writable while the
+        # device isn't streaming - the same TLParamsLocked restriction that
+        # already gates parameter changes during acquisition. Drop out of
+        # acquisition for the write and always resume afterward, success or not.
+        was_acquiring = self._acquiring
+        if was_acquiring:
+            self.stop_acquisition()
+
+        try:
+            # Matches IDS's own documented usage exactly: construct the
+            # adapter for this file and Write() straight into it. Deliberately
+            # skip FileAdapter.AvailableFileNames() - that static method isn't
+            # part of the documented upload flow and goes through a
+            # System-level path that re-initializes every registered GenTL
+            # producer, including ones unrelated to this device (a "proxy"
+            # producer has been observed to fail its own internal init on
+            # this setup, surfacing as a CTI_LOADING_ERROR here even though
+            # it's harmless to plain device discovery).
+            adapter = self._ids_peak.FileAdapter(nm, target_name)
+            adapter.Write(data)
+        except self._ids_peak.Exception as exc:
+            raise CameraError(
+                f"Failed to write '{target_name}' onto the device: {exc}"
+            ) from exc
+        finally:
+            if was_acquiring:
+                self.start_acquisition()
+
+        logger.info(
+            "Loaded calibration file '%s' (%d bytes) onto the device from %s",
+            target_name, len(data), path,
+        )
