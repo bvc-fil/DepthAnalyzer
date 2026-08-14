@@ -3,3 +3,4 @@ __pycache__/
 *.pyo
 venv/
 logs/
+.claude/settings.local.json
