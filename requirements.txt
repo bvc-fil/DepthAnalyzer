@@ -1,6 +1,6 @@
-ids_peak>=1.16
-ids_peak_ipl>=1.17
-ids_peak_icv>=1.4
-numpy>=2.0
-PySide6>=6.11
-matplotlib>=3.11
+ids_peak==1.16.0.0.9
+ids_peak_ipl==1.17.2.0.8
+ids_peak_icv==1.5.0.11292
+numpy==2.5.2
+PySide6==6.11.2
+matplotlib==3.11.1

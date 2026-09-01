@@ -1,1 +1,1 @@
-pyrealsense2>=2.55
+pyrealsense2==2.58.4.10922

@@ -2,8 +2,8 @@
 """Launches the live depth viewer application against the real camera.
 
 Which sensor to use is picked via --backend (or the NION_CAMERA_BACKEND env
-var): "ids_peak" for the Nion ToF camera (default) or "realsense" for an
-Intel RealSense D455.
+var): "ids_peak" for the Nion ToF camera (default), "realsense" for an Intel
+RealSense D455, or "singray" for a Singray Stereo PRO.
 """
 import argparse
 import os
@@ -21,7 +21,7 @@ from PySide6.QtWidgets import QApplication
 from nion_app.logging_setup import configure_logging
 from nion_app.app.main_window import MainWindow
 
-_BACKENDS = {"ids_peak", "realsense"}
+_BACKENDS = {"ids_peak", "realsense", "singray"}
 
 
 def _make_backend(name: str):
@@ -33,6 +33,10 @@ def _make_backend(name: str):
         from nion_app.camera.realsense_backend import RealSenseBackend
 
         return RealSenseBackend()
+    if name == "singray":
+        from nion_app.camera.singray_backend import SingrayBackend
+
+        return SingrayBackend()
     raise ValueError(f"Unknown camera backend '{name}' (choose from {sorted(_BACKENDS)})")
 
 

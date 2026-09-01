@@ -31,12 +31,13 @@ noise-measurement workflow.
 ## Launching the app
 
 ```
-python scripts/run_app.py [--backend {ids_peak,realsense}]
+python scripts/run_app.py [--backend {ids_peak,realsense,singray}]
 ```
 
 `--backend` (or the `NION_CAMERA_BACKEND` env var) picks which sensor backend
 to use; it defaults to `ids_peak`, the real Nion camera over Ethernet.
-`realsense` targets an Intel RealSense D455 over USB instead.
+`realsense` targets an Intel RealSense D455 over USB instead, and `singray`
+targets a Singray Stereo PRO (also USB) via its `xvsdk` SDK.
 
 On startup the app runs the guided connection sequence automatically. If a
 camera is found, live acquisition starts immediately (IR/depth preview,
@@ -112,6 +113,15 @@ Layered, backend-agnostic design under `src/nion_app/`:
     same interface (`pyrealsense2`), for accommodating a different sensor
     with similar capabilities but no hardware confidence channel and
     preset-based (not GenICam) configuration.
+  - `singray_backend.py` — a Singray Stereo PRO implementation using the
+    vendor's ctypes-based `xvsdk` module (a bare `.py` file shipped alongside
+    the SDK, not a pip package - see `setup.md` for locating/building its
+    native `.so` dependency). This device's exposed C interface has no
+    simultaneous IR channel alongside its ToF depth stream, no per-pixel
+    confidence, and no exposure/gain/frame-rate control at all for the ToF
+    sensor - see the module's docstring for how each of those constraints is
+    handled (a depth-derived grayscale image stands in for IR/ROI-selection,
+    confidence is always `None`, and parameter setters are no-ops).
   - `connection_flow.py` — `run_guided_connection()`, a linear 5-step
     power → physical link → connect → load config → set parameters sequence
     with a `ConnectionStepFailed` exception carrying the specific failing
