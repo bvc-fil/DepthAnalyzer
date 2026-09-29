@@ -5,7 +5,8 @@ with the Nion or RealSense.
 
 Differences from the other backends that shaped this implementation:
     - The vendor SDK ships `xvsdk.py` as a bare file alongside its C library,
-      not a pip package - _import_xvsdk() locates and imports it the same way
+      not a pip package - _singray_sdk.import_xvsdk() (shared with
+      singray_stereo_backend.py) locates and imports it the same way
       ids_backend.py locates its GenTL producer: an env var
       (SINGRAY_SDK_PYTHON_PATH) overriding a known default install location.
       This checkout of the SDK (~/Desktop/singray/sdk/StereoPRO) ships only
@@ -76,12 +77,11 @@ Differences from the other backends that shaped this implementation:
 from __future__ import annotations
 
 import logging
-import os
-import sys
 import time
 
 import numpy as np
 
+from nion_app.camera._singray_sdk import import_xvsdk
 from nion_app.camera.backend import (
     CameraBackend,
     CameraError,
@@ -95,10 +95,6 @@ from nion_app.camera.backend import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SDK_PYTHON_DIRS = [
-    os.path.expanduser("~/Desktop/singray/sdk/StereoPRO/python"),
-]
-
 # xv::DepthImage::Type (xv-types.h): Depth_16 = sony ToF (uint16, already mm),
 # Depth_32 = pmd ToF (float32, meters). The remaining values (IR, Cloud, Raw,
 # Eeprom, IQ) aren't distance images this backend can use.
@@ -110,28 +106,6 @@ _FRAME_POLL_INTERVAL_S = 0.005
 # xv_get_sn() is never called (see module docstring) - this device offers no
 # other safe way to read its real serial number.
 _PLACEHOLDER_SERIAL = "singray-stereo-pro"
-
-
-def _import_xvsdk():
-    """Locates and imports the vendor's `xvsdk` ctypes wrapper module."""
-    if "xvsdk" in sys.modules:
-        return sys.modules["xvsdk"]
-
-    override = os.environ.get("SINGRAY_SDK_PYTHON_PATH")
-    search_dirs = [override] if override else _DEFAULT_SDK_PYTHON_DIRS
-    for directory in search_dirs:
-        if directory and os.path.isfile(os.path.join(directory, "xvsdk.py")):
-            if directory not in sys.path:
-                sys.path.insert(0, directory)
-            import xvsdk  # type: ignore
-
-            return xvsdk
-
-    raise CameraError(
-        "Could not find the Singray Stereo PRO SDK's xvsdk.py. Set "
-        "SINGRAY_SDK_PYTHON_PATH to the SDK's 'python' directory (containing "
-        "xvsdk.py and its libxvisio-CInterface-wrapper.so dependency)."
-    )
 
 
 def _depth_to_intensity(depth_mm: np.ndarray) -> np.ndarray:
@@ -149,7 +123,7 @@ def _depth_to_intensity(depth_mm: np.ndarray) -> np.ndarray:
 
 class SingrayBackend(CameraBackend):
     def __init__(self) -> None:
-        self._xvsdk = _import_xvsdk()
+        self._xvsdk = import_xvsdk()
         self._connected = False
         self._acquiring = False
         self._device_info: DeviceInfo | None = None

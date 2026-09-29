@@ -31,13 +31,16 @@ noise-measurement workflow.
 ## Launching the app
 
 ```
-python scripts/run_app.py [--backend {ids_peak,realsense,singray}]
+python scripts/run_app.py [--backend {ids_peak,realsense,singray,singray_stereo}]
 ```
 
 `--backend` (or the `NION_CAMERA_BACKEND` env var) picks which sensor backend
 to use; it defaults to `ids_peak`, the real Nion camera over Ethernet.
-`realsense` targets an Intel RealSense D455 over USB instead, and `singray`
-targets a Singray Stereo PRO (also USB) via its `xvsdk` SDK.
+`realsense` targets an Intel RealSense D455 over USB instead. `singray` and
+`singray_stereo` both target the same Singray Stereo PRO (also USB) via its
+`xvsdk` SDK, using its ToF sensor and its fisheye stereo pair respectively -
+`singray_stereo` additionally needs a calibration file loaded (see
+`setup.md`) before its depth output means anything.
 
 On startup the app runs the guided connection sequence automatically. If a
 camera is found, live acquisition starts immediately (IR/depth preview,
@@ -113,15 +116,33 @@ Layered, backend-agnostic design under `src/nion_app/`:
     same interface (`pyrealsense2`), for accommodating a different sensor
     with similar capabilities but no hardware confidence channel and
     preset-based (not GenICam) configuration.
-  - `singray_backend.py` — a Singray Stereo PRO implementation using the
-    vendor's ctypes-based `xvsdk` module (a bare `.py` file shipped alongside
-    the SDK, not a pip package - see `setup.md` for locating/building its
-    native `.so` dependency). This device's exposed C interface has no
-    simultaneous IR channel alongside its ToF depth stream, no per-pixel
-    confidence, and no exposure/gain/frame-rate control at all for the ToF
-    sensor - see the module's docstring for how each of those constraints is
-    handled (a depth-derived grayscale image stands in for IR/ROI-selection,
-    confidence is always `None`, and parameter setters are no-ops).
+  - `singray_backend.py` — a Singray Stereo PRO implementation, using its
+    ToF sensor, against the vendor's ctypes-based `xvsdk` module (a bare
+    `.py` file shipped alongside the SDK, not a pip package - see
+    `_singray_sdk.py` and `setup.md` for locating/building its native `.so`
+    dependency). This device's exposed C interface has no simultaneous IR
+    channel alongside its ToF depth stream, no per-pixel confidence, and no
+    exposure/gain/frame-rate control at all for the ToF sensor - see the
+    module's docstring for how each of those constraints is handled (a
+    depth-derived grayscale image stands in for IR/ROI-selection, confidence
+    is always `None`, and parameter setters are no-ops).
+  - `singray_stereo_backend.py` — an alternative Stereo PRO backend that
+    computes depth itself from the fisheye stereo pair (OpenCV
+    rectify → SGBM disparity → 3D reprojection) instead of using the ToF
+    sensor, since this unit's onboard stereo-depth feature is disabled at
+    the firmware level. Needs a calibration file (fisheye intrinsics +
+    stereo extrinsics, produced by
+    `~/Desktop/singray/pythonTest/calibrationTooling/`) before depth means
+    anything - `load_configuration()` auto-loads one from
+    `SINGRAY_STEREO_CALIBRATION_PATH` or a known default path, and the
+    existing "Load Camera Calibration File..." button loads a different one
+    afterward. Unlike the ToF backend, exposure/gain here are real,
+    functioning controls (the fisheye cameras are the actual image source),
+    and `Frame.intensity` is the genuine rectified left camera image rather
+    than a synthesized stand-in. See its module docstring for the full
+    rationale. `singray_calibration.py` locates the default calibration
+    file; `_singray_sdk.py` (shared with `singray_backend.py`) locates and
+    imports the vendor's `xvsdk` module.
   - `connection_flow.py` — `run_guided_connection()`, a linear 5-step
     power → physical link → connect → load config → set parameters sequence
     with a `ConnectionStepFailed` exception carrying the specific failing

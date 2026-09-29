@@ -172,7 +172,7 @@ non-jammy machine, either:
 No equivalent step is needed for `--backend ids_peak` or `--backend
 realsense`.
 
-**Resolved issue, kept for the record**: earlier revisions of this backend
+**Resolved issue, kept for the record**: earlier revisions of `singray_backend.py`
 called only `xv_start_tof()` before reading frames, which left the ToF stream
 permanently emitting corrupt frames (`Incorrect frame recieved. All frame
 counter are not the same.` / `Failed to apply depth processing: failed to
@@ -192,6 +192,46 @@ and produces a steady stream of valid frames.
 A related, still-live constraint: `xv_get_sn()` (reading the device's serial
 number) reliably corrupts native state and crashes the process later
 whenever called anywhere in a process that also runs the SLAM/stereo/ToF
-streams - confirmed empirically, both before and after starting them. This
-backend never calls it; `DeviceInfo.serial_number` is a fixed placeholder
-instead (see `_PLACEHOLDER_SERIAL` in `singray_backend.py`).
+streams - confirmed empirically, both before and after starting them. Neither
+Singray backend ever calls it; `DeviceInfo.serial_number` is a fixed
+placeholder instead (see `_PLACEHOLDER_SERIAL` in `singray_backend.py` and
+`singray_stereo_backend.py`).
+
+## 5. Singray stereo-depth backend - extra pip package and a calibration file
+
+`--backend singray_stereo` needs everything section 4 covers (same device,
+same native SDK), plus:
+
+```
+venv/bin/pip install -r requirements-singray-stereo.txt   # only if using --backend singray_stereo
+```
+
+This installs `opencv-python-headless` (not `opencv-python` - the `-headless`
+build skips OpenCV's own GUI/video-I/O backend, which otherwise pulls in a
+second copy of Qt/GTK shared libraries into the same process as PySide6 - see
+the conda/venv library-conflict story in section 1 for why mixing two
+copies of a native GUI toolkit in one process is exactly the kind of thing
+that's caused real crashes on this project before. This backend only calls
+OpenCV's numeric functions (`cv2.fisheye.*`, `cv2.remap`, `cv2.StereoSGBM_*`,
+`cv2.reprojectImageTo3D`) - it never touches `cv2.imshow`/`highgui`).
+
+It also needs a stereo calibration file - fisheye intrinsics/distortion for
+each camera, the stereo pair's relative rotation/translation, and the
+disparity-to-depth `Q` matrix - before its depth output means anything. This
+project doesn't produce one itself; `~/Desktop/singray/pythonTest/calibrationTooling/`
+does (capture checkerboard pairs with `capture.py`, compute the calibration
+with `calibrate.py`, sanity-check it with `verify.py` - see that folder's own
+comments for the procedure, including the checkerboard size and the FOV-guess
+tuning it needs for OpenCV's fisheye optimizer to converge correctly on a
+wide-angle lens). `load_configuration()` (part of the guided connection
+sequence, step 4/5) auto-loads the resulting `.npz` from
+`SINGRAY_STEREO_CALIBRATION_PATH` if set, else from
+`~/Desktop/singray/pythonTest/calibrationTooling/stereo_calibration.npz` if
+that exists - see `find_default_calibration_path()` in
+`src/nion_app/camera/singray_calibration.py`. If neither is found, the guided
+connection fails gracefully (same as any other connection step failing) and
+recording stays disabled until a calibration is loaded via "Load Camera
+Calibration File..." in the Camera Settings dock.
+
+No equivalent step is needed for `--backend ids_peak`, `--backend
+realsense`, or `--backend singray`.

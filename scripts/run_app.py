@@ -3,7 +3,9 @@
 
 Which sensor to use is picked via --backend (or the NION_CAMERA_BACKEND env
 var): "ids_peak" for the Nion ToF camera (default), "realsense" for an Intel
-RealSense D455, or "singray" for a Singray Stereo PRO.
+RealSense D455, "singray" for a Singray Stereo PRO's ToF sensor, or
+"singray_stereo" for the same Stereo PRO's fisheye stereo pair instead
+(requires a loaded calibration file - see singray_stereo_backend.py).
 """
 import argparse
 import os
@@ -21,7 +23,7 @@ from PySide6.QtWidgets import QApplication
 from nion_app.logging_setup import configure_logging
 from nion_app.app.main_window import MainWindow
 
-_BACKENDS = {"ids_peak", "realsense", "singray"}
+_BACKENDS = {"ids_peak", "realsense", "singray", "singray_stereo"}
 
 
 def _make_backend(name: str):
@@ -37,6 +39,10 @@ def _make_backend(name: str):
         from nion_app.camera.singray_backend import SingrayBackend
 
         return SingrayBackend()
+    if name == "singray_stereo":
+        from nion_app.camera.singray_stereo_backend import SingrayStereoBackend
+
+        return SingrayStereoBackend()
     raise ValueError(f"Unknown camera backend '{name}' (choose from {sorted(_BACKENDS)})")
 
 
